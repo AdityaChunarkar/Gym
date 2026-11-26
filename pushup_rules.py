@@ -1,6 +1,10 @@
 """
 Push-up rule engine (Phase 3).
 
+CAMERA: side-on (90 degrees), camera on the floor or at most knee height,
+about 2 m away, head to feet in frame. A front view does NOT work: the body
+line and elbow bend point toward the camera and can't be measured in 2D.
+
 Works from a SIDE view, whole body in frame. For each frame it:
   1. picks the arm/body side the camera sees best,
   2. measures the elbow angle, the body line (shoulder-hip-ankle) and the neck,
@@ -21,6 +25,7 @@ As with squats, the thresholds are starting points. Calibrate them from your
 own recordings and pass a JSON file with --thresholds.
 """
 
+import math
 from dataclasses import dataclass
 
 from angles import AngleSmoother, angle_at, angle_from_vertical, to_pixels
@@ -43,6 +48,10 @@ class PushupThresholds:
     min_neck_angle: float = 150.0   # ear-shoulder-hip angle may not drop below this
     min_plank_angle: float = 50.0   # shoulder-ankle line must tilt at least this far from vertical
     min_visibility: float = 0.5     # joints below this are treated as not seen
+    # --- "is this a real rep?" checks (see rep_base.py) ---
+    max_view_ratio: float = 0.5     # shoulder width / torso length above this = not side-on
+    min_shoulder_drop: float = 0.3  # shoulders must drop at least this many upper-arm lengths
+    min_rep_time: float = 0.4       # seconds; anything faster is tracking noise
 
     @classmethod
     def from_json(cls, path):
@@ -83,16 +92,18 @@ class PushupAnalyzer(RepAnalyzer):
         self._max_sag = 0.0
         self._max_pike = 0.0
         self._min_neck = None
+        self._max_shoulder_y = -math.inf
 
     def update(self, lms, width, height, time_s=0.0):
         """Process one frame. Returns a dict describing what to show."""
         scores = self._side_visibility(lms)
         side = self._choose_side(scores)
-        if scores[side] < self.t.min_visibility:
-            return self._not_tracking(side)
-
         idx = self.SIDES[side]
         pts = to_pixels(lms, width, height)
+        problem = self._frame_problem(lms, pts, side)
+        if problem:
+            return self._abandon(side, problem)
+
         sh, hip, ank = pts[idx["shoulder"]], pts[idx["hip"]], pts[idx["ankle"]]
         raw = {
             "elbow": angle_at(sh, pts[idx["elbow"]], pts[idx["wrist"]]),
@@ -104,18 +115,29 @@ class PushupAnalyzer(RepAnalyzer):
         s = self.smoother.update(raw)
         elbow, bend, tilt, neck = s["elbow"], s["bend"], s["body_tilt"], s["neck"]
         if elbow is None or bend is None or tilt is None:   # joints on top of each other
-            return self._not_tracking(side)
+            return self._abandon(side, "hidden")
         in_plank = tilt >= self.t.min_plank_angle
 
-        finished = None
+        finished, hint = None, None
         if self.state == "UP":
-            if in_plank and elbow < self.t.descend_angle:
+            if in_plank and elbow > self.t.lockout_angle:
+                # Arms locked out in a plank: (re)measure shoulder height and
+                # upper-arm length, so the next rep can prove the body went down.
+                self.ready = True
+                self._top_shoulder_y = sh[1]
+                self._upper_arm = math.dist(sh, pts[idx["elbow"]])
+            elif not self.ready:
+                hint = self.HINTS["start"]
+            if self.ready and in_plank and elbow < self.t.descend_angle:
                 self.state = "DOWN"
+                self.rep_start = time_s
                 self._reset_rep_extremes()
         if self.state == "DOWN":
             if not in_plank:
                 self.state = "UP"        # got up mid-rep: abandon it, don't count
+                self.ready = False
             else:
+                self._max_shoulder_y = max(self._max_shoulder_y, sh[1])
                 self._min_elbow = min(self._min_elbow, elbow)
                 self._max_sag = max(self._max_sag, bend)
                 self._max_pike = max(self._max_pike, -bend)
@@ -133,13 +155,19 @@ class PushupAnalyzer(RepAnalyzer):
             if neck is not None and neck < self.t.min_neck_angle:
                 live_faults.append("neck")
 
-        return {"tracking": True, "side": side, "state": self.state,
+        return {"tracking": True, "hint": hint, "side": side, "state": self.state,
                 "reps": self.reps, "good_reps": self.good_reps, "in_plank": in_plank,
                 "metrics": {"elbow": elbow, "hip bend": bend, "neck": neck},
                 "live_faults": live_faults, "finished_rep": finished,
                 "last_rep": self.last_rep}
 
     def _finish_rep(self, side, time_s):
+        # Reject "reps" where the elbow angle flickered but the body didn't move.
+        drop = (self._max_shoulder_y - self._top_shoulder_y) / max(self._upper_arm, 1e-6)
+        if drop < self.t.min_shoulder_drop or time_s - self.rep_start < self.t.min_rep_time:
+            self.state = "UP"
+            return None
+
         faults = []
         if self._min_elbow > self.t.depth_angle:
             faults.append("depth")

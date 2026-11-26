@@ -1,6 +1,11 @@
 """
 Squat rule engine (Phase 3).
 
+CAMERA: side-on to the person (90 degrees), at hip height, 2-3 m away, whole
+body head to feet in frame. A front view does NOT work: the knees bend toward
+the camera, so in the 2D image the knee angle barely changes, and forward
+lean is invisible. Front-facing frames are detected and ignored.
+
 Works from a SIDE view. For each frame it:
   1. picks the leg/torso side the camera sees best,
   2. measures the knee angle, torso lean, shin angle and neck angle,
@@ -26,6 +31,7 @@ Calibrate them from your own good and bad recordings (record with
 phase2_angles.py --csv), then save them in a JSON file and pass --thresholds.
 """
 
+import math
 from dataclasses import dataclass
 
 from angles import AngleSmoother, angle_at, angle_from_vertical, to_pixels
@@ -48,6 +54,11 @@ class SquatThresholds:
     max_torso_shin_gap: float = 30.0   # torso lean may exceed shin lean by at most this much
     min_neck_angle: float = 140.0      # ear-shoulder-hip angle may not drop below this
     min_visibility: float = 0.5        # joints below this are treated as not seen
+    # --- "is this a real rep?" checks (see rep_base.py) ---
+    max_view_ratio: float = 0.5        # shoulder width / torso length above this = not side-on
+    min_hip_drop: float = 0.15         # hips must drop at least this many thigh-lengths
+                                       # (half squat ~0.25, parallel ~0.6, standing noise ~0)
+    min_rep_time: float = 0.5          # seconds; anything faster is tracking noise
 
     @classmethod
     def from_json(cls, path):
@@ -74,16 +85,18 @@ class SquatAnalyzer(RepAnalyzer):
         self._max_lean = 0.0
         self._max_gap = -180.0
         self._min_neck = None
+        self._max_hip_y = -math.inf
 
     def update(self, lms, width, height, time_s=0.0):
         """Process one frame. Returns a dict describing what to show."""
         scores = self._side_visibility(lms)
         side = self._choose_side(scores)
-        if scores[side] < self.t.min_visibility:
-            return self._not_tracking(side)
-
         idx = self.SIDES[side]
         pts = to_pixels(lms, width, height)
+        problem = self._frame_problem(lms, pts, side)
+        if problem:
+            return self._abandon(side, problem)
+
         raw = {
             "knee": angle_at(pts[idx["hip"]], pts[idx["knee"]], pts[idx["ankle"]]),
             "lean": angle_from_vertical(pts[idx["shoulder"]], pts[idx["hip"]]),
@@ -94,15 +107,26 @@ class SquatAnalyzer(RepAnalyzer):
         s = self.smoother.update(raw)
         knee, lean, shin, neck = s["knee"], s["lean"], s["shin"], s["neck"]
         if knee is None or lean is None or shin is None:   # joints on top of each other
-            return self._not_tracking(side)
+            return self._abandon(side, "hidden")
         gap = lean - shin
+        hip_y = pts[idx["hip"]][1]
 
-        finished = None
+        finished, hint = None, None
         if self.state == "UP":
-            if knee < self.t.descend_angle:
+            if knee > self.t.stand_angle:
+                # Standing tall: (re)measure where the hips are and how long the
+                # thigh is, so the next rep can prove the hips really went down.
+                self.ready = True
+                self._stand_hip_y = hip_y
+                self._thigh = math.dist(pts[idx["hip"]], pts[idx["knee"]])
+            elif not self.ready:
+                hint = self.HINTS["start"]
+            if self.ready and knee < self.t.descend_angle:
                 self.state = "DOWN"
+                self.rep_start = time_s
                 self._reset_rep_extremes()
         if self.state == "DOWN":
+            self._max_hip_y = max(self._max_hip_y, hip_y)
             self._min_knee = min(self._min_knee, knee)
             self._max_lean = max(self._max_lean, lean)
             self._max_gap = max(self._max_gap, gap)
@@ -120,13 +144,19 @@ class SquatAnalyzer(RepAnalyzer):
             if neck is not None and neck < self.t.min_neck_angle:
                 live_faults.append("neck")
 
-        return {"tracking": True, "side": side, "state": self.state,
+        return {"tracking": True, "hint": hint, "side": side, "state": self.state,
                 "reps": self.reps, "good_reps": self.good_reps,
                 "metrics": {"knee": knee, "lean": lean, "torso-shin": gap, "neck": neck},
                 "live_faults": live_faults, "finished_rep": finished,
                 "last_rep": self.last_rep}
 
     def _finish_rep(self, side, time_s):
+        # Reject "reps" where the knee angle flickered but the body didn't move.
+        hip_drop = (self._max_hip_y - self._stand_hip_y) / max(self._thigh, 1e-6)
+        if hip_drop < self.t.min_hip_drop or time_s - self.rep_start < self.t.min_rep_time:
+            self.state = "UP"
+            return None
+
         faults = []
         if self._min_knee > self.t.depth_angle:
             faults.append("depth")

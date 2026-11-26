@@ -14,6 +14,8 @@ USAGE
         python phase3_exercise.py --exercise squat
     Push-ups from a recorded clip:
         python phase3_exercise.py --exercise pushup --video pushups.mp4
+    Handstand holds (gymnastics) from a clip - times each hold:
+        python phase3_exercise.py --exercise handstand --video handstand.mp4
     Your calibrated thresholds, plus a CSV with one row per rep:
         python phase3_exercise.py --exercise squat --thresholds my_squat.json --reps-csv reps.csv
 
@@ -23,8 +25,16 @@ KEYS (in the video window)
     space  pause / resume
     q      quit
 
-Film from the SIDE with the whole body in frame. For push-ups, put the camera
-at floor height.
+CAMERA SETUP (this matters - the counter only works from the side)
+    - Stand SIDE-ON to the camera (90 degrees), not facing it.
+    - Whole body, head to feet, in frame. Landscape orientation.
+    - Squats: camera at hip height, about 2-3 m away.
+    - Push-ups: camera on the floor or at most knee height, about 2 m away.
+    - Plain background, good light, fitted clothes help the pose model.
+    - Start each set in the start position (standing tall / arms locked out
+      in a plank); counting begins once that is seen.
+If the screen shows "Turn SIDEWAYS" or "Can't see your whole body", fix the
+setup first - frames like that are ignored.
 """
 
 import argparse
@@ -36,12 +46,14 @@ import mediapipe as mp
 from mediapipe.tasks.python import BaseOptions, vision
 
 from phase1_pose_overlay import MODEL_PATH, draw_pose, ensure_model
+from handstand_rules import HandstandAnalyzer, HandstandThresholds
 from pushup_rules import PushupAnalyzer, PushupThresholds
 from squat_rules import SquatAnalyzer, SquatThresholds
 
 EXERCISES = {
     "squat": (SquatAnalyzer, SquatThresholds),
     "pushup": (PushupAnalyzer, PushupThresholds),
+    "handstand": (HandstandAnalyzer, HandstandThresholds),   # timed holds, not reps
 }
 
 GREEN, RED, AMBER, WHITE, GREY = (0, 200, 0), (0, 0, 255), (0, 190, 255), (255, 255, 255), (150, 150, 150)
@@ -73,12 +85,18 @@ def draw_hud(frame, exercise, info, messages, fps):
     cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
     text(frame, f"{exercise.upper()}   {fps:4.1f} fps", 10, 22, GREY, 0.5, 1)
-    text(frame, str(info["reps"]), 10, 85, WHITE, 2.2, 4)
-    text(frame, "reps", 95, 60, GREY, 0.6, 1)
-    text(frame, f"good: {info['good_reps']}", 95, 85, GREEN, 0.6, 2)
+    is_hold = "hold_s" in info
+    if is_hold:   # handstand: big live hold timer, then best hold and hold count
+        text(frame, f"{info['hold_s']:.1f}s", 10, 85, WHITE, 1.8, 4)
+        text(frame, f"best {info['best_hold_s']:.1f}s", 165, 60, GREY, 0.55, 1)
+        text(frame, f"holds {info['reps']} / clean {info['good_reps']}", 165, 85, GREEN, 0.5, 1)
+    else:
+        text(frame, str(info["reps"]), 10, 85, WHITE, 2.2, 4)
+        text(frame, "reps", 95, 60, GREY, 0.6, 1)
+        text(frame, f"good: {info['good_reps']}", 95, 85, GREEN, 0.6, 2)
 
     if not info["tracking"]:
-        text(frame, "Can't see body - film from the side", 10, 115, RED, 0.5, 1)
+        text(frame, "Not counting", 10, 115, RED, 0.5, 1)
     else:
         state = info["state"]
         if exercise == "pushup" and not info.get("in_plank", True):
@@ -90,10 +108,16 @@ def draw_hud(frame, exercise, info, messages, fps):
     y = 165
     last = info.get("last_rep")
     if last:
+        label = f"Hold {last['rep']} ({last['hold_s']:.1f}s)" if is_hold else f"Rep {last['rep']}"
         if last["ok"]:
-            text(frame, f"Rep {last['rep']}: good form", 10, y, GREEN, 0.55, 2)
+            text(frame, f"{label}: good form", 10, y, GREEN, 0.55, 2)
         else:
-            text(frame, f"Rep {last['rep']}: {', '.join(last['faults'])}", 10, y, RED, 0.55, 2)
+            text(frame, f"{label}: {', '.join(last['faults'])}", 10, y, RED, 0.55, 2)
+
+    # Setup problems (wrong camera angle, body cut off, not in start position)
+    # go big in the middle-top so they can't be missed.
+    if info.get("hint"):
+        text(frame, info["hint"], 10, 245, RED, 0.7, 2)
 
     # Live warnings go along the bottom, where they are easy to read mid-rep.
     h = frame.shape[0]
@@ -160,12 +184,16 @@ def main():
                     info = analyzer.update(lms, w, h, t_s)
                     draw_pose(display, lms, show_labels=show_labels, mirrored=mirrored)
                 else:
-                    info = analyzer._not_tracking(analyzer.side)
+                    info = analyzer._abandon(analyzer.side, "hidden")
 
                 rep = info.get("finished_rep")
                 if rep:
                     verdict = "good" if rep["ok"] else "faults: " + ", ".join(rep["faults"])
-                    print(f"Rep {rep['rep']} at {rep['time_s']:.1f}s - {verdict}")
+                    if "hold_s" in rep:
+                        print(f"Hold {rep['rep']}: {rep['hold_s']:.1f}s "
+                              f"({rep['clean_s']:.1f}s clean) - {verdict}")
+                    else:
+                        print(f"Rep {rep['rep']} at {rep['time_s']:.1f}s - {verdict}")
                     if reps_file:
                         if reps_writer is None:
                             reps_writer = csv.DictWriter(reps_file, fieldnames=list(rep))
@@ -209,7 +237,11 @@ def main():
             reps_file.close()
         if not args.no_display:
             cv2.destroyAllWindows()
-        print(f"\n{args.exercise}: {analyzer.reps} reps, {analyzer.good_reps} with good form")
+        if args.exercise == "handstand":
+            print(f"\nhandstand: {analyzer.reps} holds, {analyzer.good_reps} clean, "
+                  f"best {analyzer.best_hold:.1f}s")
+        else:
+            print(f"\n{args.exercise}: {analyzer.reps} reps, {analyzer.good_reps} with good form")
 
 
 if __name__ == "__main__":
